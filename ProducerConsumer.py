@@ -1,170 +1,215 @@
 #!/usr/bin/env python3
+
 import threading
 import cv2
 import os
 import time
-from threading import Semaphore
+import queue
 
-# Global variables
-outputDir = 'frames'
-clipFileName = 'clip.mp4'
-maxFrames = 72  # Maximum number of frames to process
+class BoundedBuffer:
+    """
+    A bounded buffer implementation using semaphores and a mutex.
+    """
+    def __init__(self, capacity=10):
+        self.buffer = []
+        self.capacity = capacity
+        # Binary semaphore (mutex) to protect the buffer
+        self.mutex = threading.Semaphore(1)
+        # Counting semaphore to track empty slots
+        self.empty_slots = threading.Semaphore(capacity)
+        # Counting semaphore to track filled slots
+        self.filled_slots = threading.Semaphore(0)
+    
+    def deposit(self, item):
+        """Add an item to the buffer (producer operation)"""
+        # Wait for an empty slot
+        self.empty_slots.acquire()
+        # Get exclusive access to the buffer
+        self.mutex.acquire()
+        try:
+            # Add the item to the buffer
+            self.buffer.append(item)
+        finally:
+            # Release the mutex
+            self.mutex.release()
+        # Signal that a slot has been filled
+        self.filled_slots.release()
+    
+    def extract(self):
+        """Remove an item from the buffer (consumer operation)"""
+        # Wait for a filled slot
+        self.filled_slots.acquire()
+        # Get exclusive access to the buffer
+        self.mutex.acquire()
+        try:
+            # Remove the item from the buffer
+            item = self.buffer.pop(0)
+        finally:
+            # Release the mutex
+            self.mutex.release()
+        # Signal that a slot has been emptied
+        self.empty_slots.release()
+        return item
 
-# Semaphores for producer-consumer coordination
-# Semaphores for Queue 1 (Extract -> Grayscale)
-empty1 = Semaphore(10)  # Initially 10 empty slots
-full1 = Semaphore(0)    # Initially 0 full slots
-mutex1 = Semaphore(1)   # Mutex for queue access
+    def size(self):
+        """Get the current size of the buffer"""
+        self.mutex.acquire()
+        try:
+            size = len(self.buffer)
+        finally:
+            self.mutex.release()
+        return size
 
-# Semaphores for Queue 2 (Grayscale -> Display)
-empty2 = Semaphore(10)  # Initially 10 empty slots
-full2 = Semaphore(0)    # Initially 0 full slots
-mutex2 = Semaphore(1)   # Mutex for queue access
+    def is_empty(self):
+        """Check if the buffer is empty"""
+        self.mutex.acquire()
+        try:
+            is_empty = len(self.buffer) == 0
+        finally:
+            self.mutex.release()
+        return is_empty
 
-# Shared buffers
-extractionQueue = []  # Queue between extraction and grayscale conversion
-displayQueue = []     # Queue between grayscale conversion and display
-
-# Create output directory if it doesn't exist
-if not os.path.exists(outputDir):
-    print(f"Output directory {outputDir} didn't exist, creating")
-    os.makedirs(outputDir)
-
-def extractFrames():
-    """Extract frames from the video file and add them to the extraction queue"""
-    print("Starting frame extraction thread")
+def extract_frames(video_filename, output_buffer, max_frames=72):
+    """
+    Extract frames from the video file and deposit them in the output buffer.
+    """
+    print(f"Starting frame extraction from {video_filename}")
     count = 0
     
-    # Open video file
-    vidcap = cv2.VideoCapture(clipFileName)
+    # Open the video clip
+    vidcap = cv2.VideoCapture(video_filename)
     
-    # Read first frame
+    # Read one frame
     success, frame = vidcap.read()
     
-    while success and count < maxFrames:
-        print(f'Extracting frame {count}')
+    while success and count < max_frames:
+        print(f'Extracted frame {count}')
         
-        # Wait for an empty slot in the queue
-        empty1.acquire()
-        
-        # Get exclusive access to the queue
-        mutex1.acquire()
-        
-        # Add the frame to the queue
-        extractionQueue.append((count, frame))
-        
-        # Release the mutex
-        mutex1.release()
-        
-        # Signal that a frame is available
-        full1.release()
+        # Put the frame in the output buffer
+        output_buffer.deposit(frame)
         
         # Read the next frame
         success, frame = vidcap.read()
         count += 1
     
+    # Signal that extraction is complete by depositing None
+    output_buffer.deposit(None)
     print('Frame extraction complete')
 
-def convertToGrayscale():
-    """Take frames from the extraction queue, convert to grayscale, and add to display queue"""
-    print("Starting grayscale conversion thread")
+def convert_to_grayscale(input_buffer, output_buffer):
+    """
+    Convert frames from the input buffer to grayscale and deposit them in the output buffer.
+    """
+    print("Starting grayscale conversion")
     count = 0
     
-    while count < maxFrames:
-        # Wait for a frame to be available
-        full1.acquire()
-        
-        # Get exclusive access to the extraction queue
-        mutex1.acquire()
-        
-        # Get a frame from the queue
-        frame_count, frame = extractionQueue.pop(0)
-        
-        # Release the mutex
-        mutex1.release()
-        
-        # Signal that there's an empty slot in the queue
-        empty1.release()
-        
-        print(f'Converting frame {frame_count} to grayscale')
-        
-        # Convert frame to grayscale
-        grayscaleFrame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Wait for an empty slot in the display queue
-        empty2.acquire()
-        
-        # Get exclusive access to the display queue
-        mutex2.acquire()
-        
-        # Add the grayscale frame to the display queue
-        displayQueue.append((frame_count, grayscaleFrame))
-        
-        # Release the mutex
-        mutex2.release()
-        
-        # Signal that a grayscale frame is available
-        full2.release()
-        
-        count += 1
+    # Process frames until None is received (end signal)
+    frame = input_buffer.extract()
     
+    while frame is not None:
+        print(f'Converting frame {count} to grayscale')
+        
+        try:
+            # Convert the frame to grayscale
+            grayscale_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # Put the grayscale frame in the output buffer
+            output_buffer.deposit(grayscale_frame)
+            
+            # Increment counter
+            count += 1
+        except Exception as e:
+            print(f"Error converting frame {count}: {e}")
+        
+        # Get the next frame
+        frame = input_buffer.extract()
+    
+    # Signal that conversion is complete by depositing None
+    output_buffer.deposit(None)
     print('Grayscale conversion complete')
 
-def displayFrames():
-    """Take grayscale frames from the display queue and display them"""
-    print("Starting frame display thread")
+def display_frames(input_buffer, frame_delay=42):
+    """
+    Display frames from the input buffer with the specified delay.
+    """
+    print("Starting frame display")
     count = 0
-    frameDelay = 42  # 42ms delay between frames (approximately 24fps)
     
-    while count < maxFrames:
-        # Wait for a grayscale frame to be available
-        full2.acquire()
+    # Process frames until None is received (end signal)
+    frame = input_buffer.extract()
+    
+    while frame is not None:
+        print(f'Displaying frame {count}')
         
-        # Get exclusive access to the display queue
-        mutex2.acquire()
-        
-        # Get a frame from the queue
-        frame_count, frame = displayQueue.pop(0)
-        
-        # Release the mutex
-        mutex2.release()
-        
-        # Signal that there's an empty slot in the queue
-        empty2.release()
-        
-        print(f'Displaying frame {frame_count}')
-        
-        # Display the frame
-        cv2.imshow('Video', frame)
-        
-        # Wait for the specified delay and check if the user wants to quit
-        if cv2.waitKey(frameDelay) and 0xFF == ord("q"):
+        try:
+            # Display the frame
+            # Make sure frame is properly formatted for display
+            if len(frame.shape) == 2:  # If grayscale
+                # Convert to 3-channel for display
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            else:
+                frame_display = frame
+                
+            # Instead of cv2.imshow
+            cv2.imwrite(f"debug_frame_{count:04d}.jpg", frame)
+            
+            # Wait for frame_delay ms and check if the user wants to quit
+            key = cv2.waitKey(frame_delay)
+            if key & 0xFF == ord("q"):
+                break
+        except Exception as e:
+            print(f"Error displaying frame {count}: {e}")
             break
         
+        # Get the next frame
+        frame = input_buffer.extract()
         count += 1
     
     print('Frame display complete')
-    # Cleanup the windows
     cv2.destroyAllWindows()
 
 def main():
-    """Main function to create and start the threads"""
+    # Video file to process
+    video_filename = 'clip.mp4'
+    
+    # Check if the video file exists
+    if not os.path.exists(video_filename):
+        print(f"Error: Video file '{video_filename}' not found.")
+        print("Please make sure the video file is in the current directory.")
+        return
+    
+    # Create the bounded buffers with a capacity of 10 frames
+    extraction_to_conversion_buffer = BoundedBuffer(10)
+    conversion_to_display_buffer = BoundedBuffer(10)
+    
     # Create the threads
-    extractThread = threading.Thread(target=extractFrames)
-    grayscaleThread = threading.Thread(target=convertToGrayscale)
-    displayThread = threading.Thread(target=displayFrames)
+    extractor_thread = threading.Thread(
+        target=extract_frames,
+        args=(video_filename, extraction_to_conversion_buffer)
+    )
+    
+    converter_thread = threading.Thread(
+        target=convert_to_grayscale,
+        args=(extraction_to_conversion_buffer, conversion_to_display_buffer)
+    )
+    
+    display_thread = threading.Thread(
+        target=display_frames,
+        args=(conversion_to_display_buffer,)
+    )
     
     # Start the threads
-    extractThread.start()
-    grayscaleThread.start()
-    displayThread.start()
+    print("Starting all threads...")
+    extractor_thread.start()
+    converter_thread.start()
+    display_thread.start()
     
     # Wait for all threads to complete
-    extractThread.join()
-    grayscaleThread.join()
-    displayThread.join()
+    extractor_thread.join()
+    converter_thread.join()
+    display_thread.join()
     
-    print("All processing complete")
+    print("All threads have completed. Program finished.")
 
 if __name__ == "__main__":
     main()
